@@ -1941,7 +1941,7 @@ public class PlanComponent extends JComponent implements PlanView, Scrollable, P
    * to make it fill <code>pageFormat</code> imageable size.
    */
   public float getPrintPreferredScale(Graphics g, PageFormat pageFormat) {
-    List<Selectable> printedItems = getPaintedItems(); 
+    List<Selectable> printedItems = getPrintedItems();
     Rectangle2D printedItemBounds = getItemsBounds(g, printedItems);
     if (printedItemBounds != null) {
       float imageableWidthCm = LengthUnit.inchToCentimeter((float)pageFormat.getImageableWidth() / 72);
@@ -1951,7 +1951,8 @@ public class PlanComponent extends JComponent implements PlanView, Scrollable, P
       int scaleInverse = (int)Math.ceil(Math.max(
           (printedItemBounds.getWidth() + 2 * extraMargin) / imageableWidthCm,
           (printedItemBounds.getHeight() + 2 * extraMargin) / imageableHeightCm));
-      return 1f / scaleInverse;
+
+      return 1f / Math.max(1, scaleInverse);
     } else {
       return 0;
     }
@@ -2002,79 +2003,123 @@ public class PlanComponent extends JComponent implements PlanView, Scrollable, P
     }
     return strokeWidth;
   }
-  
+
   /**
-   * Prints this component plan at the scale given in the home print attributes or at a scale 
-   * that makes it fill <code>pageFormat</code> imageable size if this attribute is <code>null</code>.
+   * Prints one page for each viewable level, in home level order.
    */
   public int print(Graphics g, PageFormat pageFormat, int pageIndex) {
-    List<Selectable> printedItems = getPaintedItems(); 
-    Rectangle2D printedItemBounds = getItemsBounds(g, printedItems);
-    if (printedItemBounds != null) {
-      double imageableX = pageFormat.getImageableX();
-      double imageableY = pageFormat.getImageableY();
-      double imageableWidth = pageFormat.getImageableWidth();
-      double imageableHeight = pageFormat.getImageableHeight();
-      float printScale;
-      float rowIndex;
-      float columnIndex;
-      int pagesPerRow;
-      int pagesPerColumn;
-      if (this.home.getPrint() == null || this.home.getPrint().getPlanScale() == null) {
-        // Compute a scale that ensures the plan will fill the component if plan scale is null
-        printScale = getPrintPreferredScale(g, pageFormat) * LengthUnit.centimeterToInch(72);
-        if (pageIndex > 0) {
-          return NO_SUCH_PAGE;
-        }
-        pagesPerRow = 1;
-        pagesPerColumn = 1;
-        rowIndex   = 0;
-        columnIndex = 0;
-      } else {
-        // Apply print scale to paper size expressed in 1/72nds of an inch
-        printScale = this.home.getPrint().getPlanScale().floatValue() * LengthUnit.centimeterToInch(72);
-        pagesPerRow = (int)(printedItemBounds.getWidth() * printScale / imageableWidth);
-        if (printedItemBounds.getWidth() * printScale != imageableWidth) {
-          pagesPerRow++;
-        }
-        pagesPerColumn = (int)(printedItemBounds.getHeight() * printScale / imageableHeight);
-        if (printedItemBounds.getHeight() * printScale != imageableHeight) {
-          pagesPerColumn++;
-        }
-        if (pageIndex >= pagesPerRow * pagesPerColumn) {
-          return NO_SUCH_PAGE;
-        }
-        rowIndex = pageIndex / pagesPerRow;
-        columnIndex = pageIndex - rowIndex * pagesPerRow;
-      }
-          
-      Graphics2D g2D = (Graphics2D)g.create();
-      g2D.clip(new Rectangle2D.Double(imageableX, imageableY, imageableWidth, imageableHeight));
-      // Change coordinates system to paper imageable origin
-      g2D.translate(imageableX - columnIndex * imageableWidth, imageableY - rowIndex * imageableHeight);
-      g2D.scale(printScale, printScale);
-      float extraMargin = getStrokeWidthExtraMargin(printedItems, PaintMode.PRINT);
-      g2D.translate(-printedItemBounds.getMinX() + extraMargin,
-          -printedItemBounds.getMinY() + extraMargin);
-      // Center plan in component if possible
-      g2D.translate(Math.max(0, 
-              (imageableWidth * pagesPerRow / printScale - printedItemBounds.getWidth() - 2 * extraMargin) / 2), 
-          Math.max(0, 
-              (imageableHeight * pagesPerColumn / printScale - printedItemBounds.getHeight() - 2 * extraMargin) / 2));
-      setRenderingHints(g2D);
-      try {
-        // Print component contents
-        paintContent(g2D, printScale, PaintMode.PRINT);
-      } catch (InterruptedIOException ex) {
-        // Ignore exception because it may happen only in EXPORT paint mode 
-      }   
-      g2D.dispose();
-      return PAGE_EXISTS;
-    } else {
+    if (pageIndex < 0) {
       return NO_SUCH_PAGE;
     }
+
+    List<Level> viewableLevels = new ArrayList<Level>();
+    for (Level level : this.home.getLevels()) {
+      if (level.isViewable()) {
+        viewableLevels.add(level);
+      }
+    }
+
+    // A home without explicit levels still has a single plan.
+    if (this.home.getLevels().isEmpty()) {
+      return pageIndex == 0
+        ? printSelectedLevel(g, pageFormat)
+        : NO_SUCH_PAGE;
+    }
+
+    if (pageIndex >= viewableLevels.size()) {
+      return NO_SUCH_PAGE;
+    }
+
+    Level previousLevel = this.home.getSelectedLevel();
+    try {
+      this.home.setSelectedLevel(viewableLevels.get(pageIndex));
+      return printSelectedLevel(g, pageFormat);
+    } finally {
+      this.home.setSelectedLevel(previousLevel);
+    }
   }
-  
+
+  /**
+   * Fits the selected level onto one printed page.
+   */
+  private int printSelectedLevel(Graphics g, PageFormat pageFormat) {
+    double imageableWidth = pageFormat.getImageableWidth();
+    double imageableHeight = pageFormat.getImageableHeight();
+
+    if (imageableWidth <= 0 || imageableHeight <= 0) {
+      return NO_SUCH_PAGE;
+    }
+
+    List<Selectable> printedItems = getPrintedItems();
+    Rectangle2D printedItemBounds = getItemsBounds(g, printedItems);
+
+    // Keep a page for an empty level so later levels can still be printed.
+    if (printedItemBounds == null) {
+      return PAGE_EXISTS;
+    }
+
+    float printScale = getPrintPreferredScale(g, pageFormat)
+      * LengthUnit.centimeterToInch(72);
+
+    Graphics2D g2D = (Graphics2D)g.create();
+    try {
+      double imageableX = pageFormat.getImageableX();
+      double imageableY = pageFormat.getImageableY();
+
+      g2D.clip(new Rectangle2D.Double(
+        imageableX, imageableY, imageableWidth, imageableHeight));
+
+      g2D.translate(imageableX, imageableY);
+      g2D.scale(printScale, printScale);
+
+      float extraMargin =
+        getStrokeWidthExtraMargin(printedItems, PaintMode.PRINT);
+
+      g2D.translate(
+        -printedItemBounds.getMinX() + extraMargin,
+        -printedItemBounds.getMinY() + extraMargin);
+
+      // Center the level within the printable area.
+      g2D.translate(
+        Math.max(0,
+          (imageableWidth / printScale
+            - printedItemBounds.getWidth() - 2 * extraMargin) / 2),
+        Math.max(0,
+          (imageableHeight / printScale
+            - printedItemBounds.getHeight() - 2 * extraMargin) / 2));
+
+      setRenderingHints(g2D);
+
+      try {
+        paintContent(g2D, printScale, PaintMode.PRINT);
+      } catch (InterruptedIOException ex) {
+        // This exception is expected only in EXPORT paint mode.
+      }
+
+      return PAGE_EXISTS;
+    } finally {
+      g2D.dispose();
+    }
+  }
+
+
+  /**
+   * Returns the items to include when printing the selected level.
+   */
+  private List<Selectable> getPrintedItems() {
+    List<Selectable> printedItems = new ArrayList<Selectable>();
+
+    for (Selectable item : getPaintedItems()) {
+      if (!(item instanceof Elevatable)
+        || isViewableAtSelectedLevel((Elevatable)item)) {
+        printedItems.add(item);
+      }
+    }
+
+    return printedItems;
+  }
+
+
   /**
    * Returns an image of the selected items displayed by this component 
    * (camera excepted) with no outline at scale 1/1 (1 pixel = 1cm).
